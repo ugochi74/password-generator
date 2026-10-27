@@ -7,8 +7,16 @@ unsuitable for anything security-related; `secrets` is designed specifically
 for this).
 """
 
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from collections.abc import Sequence
+import json
+import math
 import secrets
 import string
+import sys
 
 
 CHARACTER_SETS = {
@@ -17,101 +25,116 @@ CHARACTER_SETS = {
     "digits": string.digits,
     "symbols": string.punctuation,
 }
-
-# Characters that are easy to visually confuse (1/l/I, 0/O, etc.)
 AMBIGUOUS_CHARS = "il1LoO0"
+MAX_PASSWORD_LENGTH = 4096
+MAX_PASSWORD_COUNT = 10_000
 
 
-def build_character_pool(use_lowercase, use_uppercase, use_digits, use_symbols, avoid_ambiguous):
-    """Combine the selected character sets into one pool to draw from."""
-    pool = ""
-    if use_lowercase:
-        pool += CHARACTER_SETS["lowercase"]
-    if use_uppercase:
-        pool += CHARACTER_SETS["uppercase"]
-    if use_digits:
-        pool += CHARACTER_SETS["digits"]
-    if use_symbols:
-        pool += CHARACTER_SETS["symbols"]
+@dataclass(frozen=True)
+class PasswordOptions:
+    length: int = 12
+    count: int = 1
+    use_lowercase: bool = True
+    use_uppercase: bool = True
+    use_digits: bool = True
+    use_symbols: bool = True
+    avoid_ambiguous: bool = False
 
-    if not pool:
-        raise ValueError("At least one character type must be selected.")
-
-    if avoid_ambiguous:
-        pool = "".join(ch for ch in pool if ch not in AMBIGUOUS_CHARS)
-
-    return pool
-
-
-def generate_password(length=12, use_lowercase=True, use_uppercase=True,
-                       use_digits=True, use_symbols=True, avoid_ambiguous=False):
-    """
-    Generate a random password of the given length, guaranteeing at least
-    one character from each selected category (so requesting symbols
-    doesn't mean you might get zero of them by chance).
-    """
-    if length < 1:
-        raise ValueError("Length must be at least 1.")
-
-    selected_sets = []
-    if use_lowercase:
-        selected_sets.append(CHARACTER_SETS["lowercase"])
-    if use_uppercase:
-        selected_sets.append(CHARACTER_SETS["uppercase"])
-    if use_digits:
-        selected_sets.append(CHARACTER_SETS["digits"])
-    if use_symbols:
-        selected_sets.append(CHARACTER_SETS["symbols"])
-
-    if not selected_sets:
-        raise ValueError("At least one character type must be selected.")
-
-    if avoid_ambiguous:
-        selected_sets = ["".join(ch for ch in s if ch not in AMBIGUOUS_CHARS) for s in selected_sets]
-        selected_sets = [s for s in selected_sets if s]  # drop any set emptied entirely
-
-    if length < len(selected_sets):
-        raise ValueError(
-            f"Length must be at least {len(selected_sets)} to include "
-            f"one of each selected character type."
+    def character_sets(self) -> tuple[str, ...]:
+        enabled = (
+            ("lowercase", self.use_lowercase),
+            ("uppercase", self.use_uppercase),
+            ("digits", self.use_digits),
+            ("symbols", self.use_symbols),
         )
+        sets = tuple(
+            filter_ambiguous(CHARACTER_SETS[name]) if self.avoid_ambiguous else CHARACTER_SETS[name]
+            for name, included in enabled
+            if included
+        )
+        if not sets:
+            raise ValueError("At least one character type must be selected.")
+        return sets
 
-    full_pool = build_character_pool(use_lowercase, use_uppercase, use_digits, use_symbols, avoid_ambiguous)
+    def validate(self) -> None:
+        sets = self.character_sets()
+        if not 1 <= self.length <= MAX_PASSWORD_LENGTH:
+            raise ValueError(f"Length must be between 1 and {MAX_PASSWORD_LENGTH}.")
+        if self.length < len(sets):
+            raise ValueError(
+                f"Length must be at least {len(sets)} to include one of each "
+                "selected character type."
+            )
+        if not 1 <= self.count <= MAX_PASSWORD_COUNT:
+            raise ValueError(f"Count must be between 1 and {MAX_PASSWORD_COUNT}.")
 
-    # Guarantee at least one character from each selected category
-    password_chars = [secrets.choice(s) for s in selected_sets]
+    def character_pool(self) -> str:
+        self.validate()
+        return "".join(dict.fromkeys("".join(self.character_sets())))
 
-    # Fill the rest randomly from the combined pool
-    remaining = length - len(password_chars)
-    password_chars += [secrets.choice(full_pool) for _ in range(remaining)]
 
-    # Shuffle so the guaranteed characters aren't predictably at the start
+def filter_ambiguous(characters: str) -> str:
+    return "".join(character for character in characters if character not in AMBIGUOUS_CHARS)
+
+
+def build_character_pool(
+    use_lowercase: bool,
+    use_uppercase: bool,
+    use_digits: bool,
+    use_symbols: bool,
+    avoid_ambiguous: bool,
+) -> str:
+    """Combine selected character sets into a deduplicated pool."""
+    options = PasswordOptions(
+        use_lowercase=use_lowercase,
+        use_uppercase=use_uppercase,
+        use_digits=use_digits,
+        use_symbols=use_symbols,
+        avoid_ambiguous=avoid_ambiguous,
+    )
+    return options.character_pool()
+
+
+def generate_password(
+    length: int = 12,
+    use_lowercase: bool = True,
+    use_uppercase: bool = True,
+    use_digits: bool = True,
+    use_symbols: bool = True,
+    avoid_ambiguous: bool = False,
+) -> str:
+    """Generate a password with at least one character from each enabled set."""
+    options = PasswordOptions(
+        length=length,
+        use_lowercase=use_lowercase,
+        use_uppercase=use_uppercase,
+        use_digits=use_digits,
+        use_symbols=use_symbols,
+        avoid_ambiguous=avoid_ambiguous,
+    )
+    options.validate()
+    password_chars = [secrets.choice(characters) for characters in options.character_sets()]
+    pool = options.character_pool()
+    password_chars.extend(secrets.choice(pool) for _ in range(length - len(password_chars)))
     secrets.SystemRandom().shuffle(password_chars)
-
     return "".join(password_chars)
 
 
-def estimate_strength(password):
-    """
-    Rough password strength estimate based on entropy (bits of randomness).
-    This is a simplification for user feedback, not a rigorous security audit.
-    """
-    pool_size = 0
-    if any(c in string.ascii_lowercase for c in password):
-        pool_size += 26
-    if any(c in string.ascii_uppercase for c in password):
-        pool_size += 26
-    if any(c in string.digits for c in password):
-        pool_size += 10
-    if any(c in string.punctuation for c in password):
-        pool_size += len(string.punctuation)
+def estimate_strength(password: str, pool: str | None = None) -> tuple[int, str]:
+    """Estimate strength from the exact character pool used to make the password."""
+    if pool is None:
+        pool = "".join(
+            characters
+            for characters, active in (
+                (string.ascii_lowercase, any(char in string.ascii_lowercase for char in password)),
+                (string.ascii_uppercase, any(char in string.ascii_uppercase for char in password)),
+                (string.digits, any(char in string.digits for char in password)),
+                (string.punctuation, any(char in string.punctuation for char in password)),
+            )
+            if active
+        )
 
-    if pool_size == 0:
-        return 0, "N/A"
-
-    import math
-    entropy_bits = len(password) * math.log2(pool_size)
-
+    entropy_bits = len(password) * math.log2(len(pool)) if password and pool else 0
     if entropy_bits < 40:
         label = "Weak"
     elif entropy_bits < 60:
@@ -120,11 +143,10 @@ def estimate_strength(password):
         label = "Strong"
     else:
         label = "Very Strong"
-
     return round(entropy_bits), label
 
 
-def ask_yes_no(prompt, default=True):
+def ask_yes_no(prompt: str, default: bool = True) -> bool:
     """Ask a yes/no question, accepting y/n/yes/no/blank (blank = default)."""
     suffix = " [Y/n]: " if default else " [y/N]: "
     while True:
@@ -138,77 +160,117 @@ def ask_yes_no(prompt, default=True):
         print("Please answer y or n.")
 
 
-def ask_length():
-    """Ask for password length, validating it's a positive integer."""
+def ask_positive_integer(prompt: str, default: int, maximum: int) -> int:
     while True:
-        raw = input("Password length [12]: ").strip()
-        if raw == "":
-            return 12
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return default
         try:
             value = int(raw)
-            if value < 1:
-                print("Length must be at least 1.")
-                continue
-            return value
+            if 1 <= value <= maximum:
+                return value
         except ValueError:
-            print("Please enter a whole number.")
+            pass
+        print(f"Please enter a whole number from 1 to {maximum}.")
 
 
-def main():
-    print("=== Password Generator ===\n")
+def interactive_options() -> PasswordOptions:
+    print("=== Password Generator ===")
+    length = ask_positive_integer("Password length", 12, MAX_PASSWORD_LENGTH)
+    use_lowercase = ask_yes_no("Include lowercase letters?", True)
+    use_uppercase = ask_yes_no("Include uppercase letters?", True)
+    use_digits = ask_yes_no("Include digits?", True)
+    use_symbols = ask_yes_no("Include symbols?", True)
+    avoid_ambiguous = ask_yes_no("Avoid ambiguous characters (l, 1, I, O, 0)?", False)
+    options = PasswordOptions(
+        length=length,
+        use_lowercase=use_lowercase,
+        use_uppercase=use_uppercase,
+        use_digits=use_digits,
+        use_symbols=use_symbols,
+        avoid_ambiguous=avoid_ambiguous,
+    )
+    options.validate()
+    count = ask_positive_integer("How many passwords", 1, MAX_PASSWORD_COUNT)
+    return PasswordOptions(**{**options.__dict__, "count": count})
 
-    while True:
-        print("\n1. Generate a password")
-        print("2. Generate multiple passwords")
-        print("3. Quit")
-        choice = input("Choose an option (1-3): ").strip()
 
-        if choice == "1":
-            length = ask_length()
-            use_lower = ask_yes_no("Include lowercase letters?", default=True)
-            use_upper = ask_yes_no("Include uppercase letters?", default=True)
-            use_digits = ask_yes_no("Include digits?", default=True)
-            use_symbols = ask_yes_no("Include symbols?", default=True)
-            avoid_ambiguous = ask_yes_no("Avoid ambiguous characters (l, 1, I, O, 0)?", default=False)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate cryptographically secure passwords.")
+    parser.add_argument("--length", type=int, default=12, help="password length (default: 12)")
+    parser.add_argument("--count", type=int, default=1, help="number of passwords (default: 1)")
+    parser.add_argument("--no-lowercase", action="store_true", help="exclude lowercase letters")
+    parser.add_argument("--no-uppercase", action="store_true", help="exclude uppercase letters")
+    parser.add_argument("--no-digits", action="store_true", help="exclude digits")
+    parser.add_argument("--no-symbols", action="store_true", help="exclude symbols")
+    parser.add_argument("--exclude-ambiguous", action="store_true", help="exclude visually ambiguous characters")
+    parser.add_argument("--interactive", action="store_true", help="use prompts instead of command options")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    parser.add_argument("--no-strength", action="store_true", help="omit human-readable strength labels")
+    return parser
 
-            try:
-                password = generate_password(
-                    length, use_lower, use_upper, use_digits, use_symbols, avoid_ambiguous
-                )
-                bits, label = estimate_strength(password)
-                print(f"\nGenerated password: {password}")
-                print(f"Estimated strength: {label} (~{bits} bits of entropy)")
-            except ValueError as e:
-                print(f"\nError: {e}")
 
-        elif choice == "2":
-            count = input("How many passwords? [5]: ").strip()
-            count = int(count) if count.isdigit() and int(count) > 0 else 5
+def render_passwords(options: PasswordOptions, as_json: bool, include_strength: bool) -> None:
+    pool = options.character_pool()
+    results = []
+    for _ in range(options.count):
+        password = generate_password(
+            options.length,
+            options.use_lowercase,
+            options.use_uppercase,
+            options.use_digits,
+            options.use_symbols,
+            options.avoid_ambiguous,
+        )
+        entropy_bits, strength = estimate_strength(password, pool)
+        results.append({
+            "password": password,
+            "length": options.length,
+            "entropy_bits": entropy_bits,
+            "strength": strength,
+        })
 
-            length = ask_length()
-            use_lower = ask_yes_no("Include lowercase letters?", default=True)
-            use_upper = ask_yes_no("Include uppercase letters?", default=True)
-            use_digits = ask_yes_no("Include digits?", default=True)
-            use_symbols = ask_yes_no("Include symbols?", default=True)
-            avoid_ambiguous = ask_yes_no("Avoid ambiguous characters (l, 1, I, O, 0)?", default=False)
+    if as_json:
+        print(json.dumps(results if options.count > 1 else results[0], indent=2))
+        return
 
-            try:
-                print()
-                for i in range(count):
-                    password = generate_password(
-                        length, use_lower, use_upper, use_digits, use_symbols, avoid_ambiguous
-                    )
-                    bits, label = estimate_strength(password)
-                    print(f"{i + 1}. {password}  ({label}, ~{bits} bits)")
-            except ValueError as e:
-                print(f"\nError: {e}")
+    for index, result in enumerate(results, start=1):
+        suffix = f"  ({result['strength']}, ~{result['entropy_bits']} bits)" if include_strength else ""
+        prefix = f"{index}. " if options.count > 1 else ""
+        print(f"{prefix}{result['password']}{suffix}")
 
-        elif choice == "3":
-            print("Goodbye!")
-            break
 
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(arguments)
+
+    try:
+        if args.interactive or not arguments:
+            options = interactive_options()
         else:
-            print("Invalid choice! Please select 1, 2, or 3.")
+            options = PasswordOptions(
+                length=args.length,
+                count=args.count,
+                use_lowercase=not args.no_lowercase,
+                use_uppercase=not args.no_uppercase,
+                use_digits=not args.no_digits,
+                use_symbols=not args.no_symbols,
+                avoid_ambiguous=args.exclude_ambiguous,
+            )
+            options.validate()
+        render_passwords(options, args.json, not args.no_strength)
+        return 0
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.", file=sys.stderr)
+        return 130
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 
 
 if __name__ == "__main__":
