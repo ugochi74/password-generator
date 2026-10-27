@@ -67,22 +67,29 @@ class LabRequestHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "Not found."})
             return
 
-        expected_hosts = {
-            f"127.0.0.1:{self.server.server_port}",
-            f"localhost:{self.server.server_port}",
-        }
-        if self.headers.get("Host", "") not in expected_hosts:
-            self._json(403, {"error": "Use the local address shown in the terminal."})
-            return
-
+        host = self.headers.get("Host", "")
         origin = self.headers.get("Origin")
-        allowed_origins = {
-            f"http://127.0.0.1:{self.server.server_port}",
-            f"http://localhost:{self.server.server_port}",
-        }
-        if origin is not None and origin not in allowed_origins:
-            self._json(403, {"error": "Cross-origin requests are not allowed."})
-            return
+        if origin is None:
+            local_hosts = {
+                f"127.0.0.1:{self.server.server_port}",
+                f"localhost:{self.server.server_port}",
+            }
+            if host not in local_hosts:
+                self._json(403, {"error": "Use the local address shown in the terminal."})
+                return
+        else:
+            parsed_origin = urlsplit(origin)
+            if (
+                parsed_origin.scheme not in {"http", "https"}
+                or parsed_origin.netloc.lower() != host.lower()
+                or parsed_origin.path
+                or parsed_origin.query
+                or parsed_origin.fragment
+                or parsed_origin.username is not None
+                or parsed_origin.password is not None
+            ):
+                self._json(403, {"error": "Cross-origin requests are not allowed."})
+                return
 
         try:
             content_length = int(self.headers.get("Content-Length", ""))
